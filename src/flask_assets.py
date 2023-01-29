@@ -15,6 +15,8 @@ from webassets.env import (BaseEnvironment, ConfigStorage, Resolver,
 from webassets.filter import Filter, register_filter
 from webassets.loaders import PythonLoader, YAMLLoader
 
+from jinja2.ext import Extension, nodes
+
 __version__ = (2, 0)
 # webassets core compatibility used in setup.py
 __webassets_version__ = ('>=2.0', )
@@ -46,6 +48,192 @@ class Jinja2Filter(Filter):
 # custom filter uses Flask's ``render_template_string`` function to provide all
 # the standard Flask template context variables.
 register_filter(Jinja2Filter)
+
+
+class AssetsExtension(Extension):
+    """
+    As opposed to the Django tag, this tag is slightly more capable due
+    to the expressive powers inherited from Jinja. For example:
+
+        {% assets "src1.js", "src2.js", get_src3(),
+                  filter=("jsmin", "gzip"), output=get_output() %}
+        {% endassets %}
+    """
+
+    tags = set(['assets'])
+
+    BundleClass = Bundle   # Helpful for mocking during tests.
+
+    def __init__(self, environment):
+        super(AssetsExtension, self).__init__(environment)
+
+        # Add the defaults to the environment
+        environment.extend(
+            assets_environment=None,
+        )
+
+    def parse(self, parser):
+        lineno = next(parser.stream).lineno
+
+        files = []
+        output = nodes.Const(None)
+        filters = nodes.Const(None)
+        dbg = nodes.Const(None)
+        depends = nodes.Const(None)
+
+        # Parse the arguments
+        first = True
+        while parser.stream.current.type != 'block_end':
+            if not first:
+                parser.stream.expect('comma')
+            first = False
+
+            # Lookahead to see if this is an assignment (an option)
+            if parser.stream.current.test('name') and parser.stream.look().test('assign'):
+                name = next(parser.stream).value
+                parser.stream.skip()
+                value = parser.parse_expression()
+                if name == 'filters':
+                    filters = value
+                elif name == 'filter':
+                    filters = value
+                    warnings.warn('The "filter" option of the {%% assets %%} '
+                                  'template tag has been renamed to '
+                                  '"filters" for consistency reasons '
+                                  '(line %s).' % lineno,
+                                    ImminentDeprecationWarning)
+                elif name == 'output':
+                    output = value
+                elif name == 'debug':
+                    dbg = value
+                elif name == 'depends':
+                    depends = value
+                else:
+                    parser.fail('Invalid keyword argument: %s' % name)
+            # Otherwise assume a source file is given, which may be any
+            # expression, except note that strings are handled separately above.
+            else:
+                expression = parser.parse_expression()
+                if isinstance(expression, (nodes.List, nodes.Tuple)):
+                    files.extend(expression.iter_child_nodes())
+                else:
+                    files.append(expression)
+
+        # Parse the contents of this tag
+        body = parser.parse_statements(['name:endassets'], drop_needle=True)
+
+        # We want to make some values available to the body of our tag.
+        # Specifically, the file url(s) (ASSET_URL), and any extra dict set in
+        # the bundle (EXTRA).
+        #
+        # A short interlope: I would have preferred to make the values of the
+        # extra dict available directly. Unfortunately, the way Jinja2 does
+        # things makes this problematic. I'll explain.
+        #
+        # Jinja2 generates Python code from it's AST which it then executes.
+        # So the way extensions implement making custom variables available to
+        # a block of code is by generating a ``CallBlock``, which essentially
+        # wraps our child nodes in a Python function. The arguments of this
+        # function are the values that are available to our tag contents.
+        #
+        # But we need to generate this ``CallBlock`` now, during parsing, and
+        # right now we don't know the actual ``Bundle.extra`` values yet. We
+        # only resolve the bundle during rendering!
+        #
+        # This would easily be solved if Jinja2 where to allow extensions to
+        # scope it's context, which is a dict of values that templates can
+        # access, just like in Django (you might see on occasion
+        # ``context.resolve('foo')`` calls in Jinja2's generated code).
+        # However, it seems the context is essentially only for the initial
+        # set of data passed to render(). There are some statements by Armin
+        # that this might change at some point, but I've run into this problem
+        # before, and I'm not holding my breath.
+        #
+        # I **really** did try to get around this, including crazy things like
+        # inserting custom Python code by patching the tag child nodes::
+        #
+        #        rv = object.__new__(nodes.InternalName)
+        #        # l_EXTRA is the argument we defined for the CallBlock/Macro
+        #        # Letting Jinja define l_kwargs is also possible
+        #        nodes.Node.__init__(rv, '; context.vars.update(l_EXTRA)',
+        #                            lineno=lineno)
+        #        # Scope required to ensure our code on top
+        #        body = [rv, nodes.Scope(body)]
+        #
+        # This custom code would run at the top of the function in which the
+        # CallBlock node would wrap the code generated from our tag's child
+        # nodes. Note that it actually does works, but doesn't clear the values
+        # at the end of the scope).
+        #
+        # If it is possible to do this, it certainly isn't reasonable/
+        #
+        # There is of course another option altogether: Simple resolve the tag
+        # definition to a bundle right here and now, thus get access to the
+        # extra dict, make all values arguments to the CallBlock (Limited to
+        # 255 arguments to a Python function!). And while that would work fine
+        # in 99% of cases, it wouldn't be correct. The compiled template could
+        # be cached and used with different bundles/environments, and this
+        # would require the bundle to resolve at parse time, and hardcode it's
+        # extra values.
+        #
+        # Interlope end.
+        #
+        # Summary: We have to be satisfied with a single EXTRA variable.
+        args = [nodes.Name('ASSET_URL', 'param'),
+                nodes.Name('ASSET_SRI', 'param'),
+                nodes.Name('EXTRA', 'param')]
+
+        # Return a ``CallBlock``, which means Jinja2 will call a Python method
+        # of ours when the tag needs to be rendered. That method can then
+        # render the template body.
+        call = self.call_method(
+            # Note: Changing the args here requires updating ``Jinja2Loader``
+            '_render_assets', args=[filters, output, dbg, depends, nodes.List(files)])
+        call_block = nodes.CallBlock(call, args, [], body)
+        call_block.set_lineno(lineno)
+        return call_block
+
+    @classmethod
+    def resolve_contents(cls, contents, env):
+        """Resolve bundle names."""
+        result = []
+        for f in contents:
+            try:
+                result.append(env[f])
+            except KeyError:
+                result.append(f)
+        return result
+
+    async def _render_assets(self, filter, output, dbg, depends, files, caller=None):
+        env = self.environment.assets_environment
+        if env is None:
+            raise RuntimeError('No assets environment configured in '+
+                               'Jinja2 environment')
+
+        # Construct a bundle with the given options
+        bundle_kwargs = {
+            'output': output,
+            'filters': filter,
+            'debug': dbg,
+            'depends': depends
+        }
+        bundle = self.BundleClass(
+            *self.resolve_contents(files, env), **bundle_kwargs)
+
+        # Retrieve urls (this may or may not cause a build)
+        with bundle.bind(env):
+            urls = bundle.urls(calculate_sri=True)
+
+        # For each url, execute the content of this template tag (represented
+        # by the macro ```caller`` given to use by Jinja2).
+        result = u""
+        for entry in urls:
+            if isinstance(entry, dict):
+                result += await caller(entry['uri'], entry.get('sri', None), bundle.extra)
+            else:
+                result += await caller(entry, None, bundle.extra)
+        return result
+
 
 
 class FlaskConfigStorage(ConfigStorage):
@@ -356,7 +544,8 @@ class Environment(BaseEnvironment):
     """The base url to which all static urls will be relative to.""")
 
     def init_app(self, app):
-        app.jinja_env.add_extension('webassets.ext.jinja2.AssetsExtension')
+        # app.jinja_env.add_extension('webassets.ext.jinja2.AssetsExtension')
+        app.jinja_env.add_extension(AssetsExtension)
         app.jinja_env.assets_environment = self
 
     def from_yaml(self, path):
@@ -412,7 +601,7 @@ else:
             return env
 
         def load_from_templates(self, env, jinja_extension):
-            from webassets.ext.jinja2 import Jinja2Loader, AssetsExtension
+            from webassets.ext.jinja2 import Jinja2Loader
             from flask import current_app as app
 
             # Use the application's Jinja environment to parse
